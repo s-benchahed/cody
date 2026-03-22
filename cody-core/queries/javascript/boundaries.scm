@@ -1,0 +1,48 @@
+; Express: res.setHeader / res.set
+(call_expression
+  function: (member_expression
+    object: (identifier) @obj (#match? @obj "res|response")
+    property: (property_identifier) @method (#match? @method "^(setHeader|set|header)$"))
+  arguments: (arguments (string) @key .)) @http_header_write
+
+; Express: req.headers access
+(subscript_expression
+  object: (member_expression
+    object: (identifier) @obj (#match? @obj "req|request")
+    property: (property_identifier) @prop (#eq? @prop "headers"))
+  index: (string) @key) @http_header_read
+
+; Redis reads: get, hget, del, rpop, lrange, zrange
+(call_expression
+  function: (member_expression
+    object: (identifier) @obj
+    property: (property_identifier) @method (#match? @method "^(get|hget|del|rpop|lrange|zrange|exists|ttl)$"))
+  arguments: (arguments (string) @key .)) @redis_get
+
+; Redis writes: set, hset, setex, lpush, zadd
+(call_expression
+  function: (member_expression
+    object: (identifier) @obj
+    property: (property_identifier) @method (#match? @method "^(set|hset|setex|lpush|rpush|zadd|lset|expire|persist)$"))
+  arguments: (arguments (string) @key .)) @redis_set
+
+; process.env access
+(member_expression
+  object: (member_expression
+    object: (identifier) @proc (#eq? @proc "process")
+    property: (property_identifier) @env (#eq? @env "env"))
+  property: (property_identifier) @key) @env_read
+
+; WebSocket: socket.emit / socket.on
+(call_expression
+  function: (member_expression
+    object: (identifier) @obj
+    property: (property_identifier) @method (#match? @method "^(emit|on|send)$"))
+  arguments: (arguments (string) @key .)) @ws_op
+
+; fs.readFile / fs.writeFile
+(call_expression
+  function: (member_expression
+    object: (identifier) @obj (#match? @obj "^(fs|promises)$")
+    property: (property_identifier) @method (#match? @method "^(readFile|writeFile|readFileSync|writeFileSync)$"))
+  arguments: (arguments . (string) @key)) @fs_op

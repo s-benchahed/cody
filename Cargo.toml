@@ -1,0 +1,3 @@
+[workspace]
+members = ["cody-core", "cody"]
+resolver = "2"
