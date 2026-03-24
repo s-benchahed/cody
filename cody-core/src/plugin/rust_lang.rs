@@ -213,10 +213,10 @@ impl LanguagePlugin for RustPlugin {
             }
         }
 
-        // Rust extractor middleware detection
+        // Detect handler functions by presence of known Axum framework extractors.
+        // Only adds hints for functions not already detected via route registration.
+        // Never sets middleware — auth labels come only from route wrappers above.
         let extractor_fn_re = once_cell::sync::Lazy::force(&crate::patterns::http::RUST_EXTRACTOR_FN_RE);
-        let extractor_types_re = once_cell::sync::Lazy::force(&crate::patterns::http::RUST_EXTRACTOR_TYPES_RE);
-        // Build a set of known route handler names
         let route_names: std::collections::HashSet<String> = hints.iter()
             .filter(|h| h.kind == "route")
             .map(|h| h.fn_name.clone())
@@ -224,24 +224,13 @@ impl LanguagePlugin for RustPlugin {
 
         for cap in extractor_fn_re.captures_iter(src) {
             let fn_name = cap.get(1).map_or("", |m| m.as_str()).to_string();
-            if fn_name.is_empty() { continue; }
-            // Collect extractor types from the params substring
-            let full_match = cap.get(0).map_or("", |m| m.as_str());
-            let mw: Vec<String> = extractor_types_re.captures_iter(full_match)
-                .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
-                .collect();
-            if mw.is_empty() { continue; }
-
-            if let Some(existing) = hints.iter_mut().find(|h| h.fn_name == fn_name && h.kind == "route") {
-                existing.middleware = mw;
-            } else if !route_names.contains(&fn_name) {
-                hints.push(EntryPointHint {
-                    fn_name, file: file_str.clone(), line: None,
-                    kind: "route".into(), framework: Some("axum".into()),
-                    path: None, method: None,
-                    confidence: 0.75, heuristic: "extractor_fn".into(), middleware: mw,
-                });
-            }
+            if fn_name.is_empty() || route_names.contains(&fn_name) { continue; }
+            hints.push(EntryPointHint {
+                fn_name, file: file_str.clone(), line: None,
+                kind: "route".into(), framework: Some("axum".into()),
+                path: None, method: None,
+                confidence: 0.75, heuristic: "extractor_fn".into(), middleware: vec![],
+            });
         }
 
         Ok(hints)

@@ -63,16 +63,13 @@ pub static DJANGO_URL_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?:path|re_path)\s*\(\s*r?['"]([^'"]+)['"]\s*,\s*(\w+)"#).unwrap()
 });
 
-// Rust/Axum: fn handler(user: LpAuthUser, State(s): State<AppState>, ...) — extractor types in params
+// Rust/Axum: detect handler functions by presence of known Axum framework extractors.
+// Only used to identify that a function IS a handler — never for middleware/auth labels.
+// Auth middleware comes exclusively from route wrapper detection (AXUM_WRAPPED_ROUTE_RE).
 pub static RUST_EXTRACTOR_FN_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
-        r#"(?:async\s+)?(?:pub\s+)?fn\s+(\w+)\s*\((?:[^)]*\b(?:State|Extension|AuthUser|LpAuthUser|CurrentUser|AdminUser|Claims|JwtClaims)\b[^)]*)\)"#
+        r#"(?:async\s+)?(?:pub\s+)?fn\s+(\w+)\s*\((?:[^)]*\b(?:State|Extension|Json|Path|Query|Form|Multipart)\b[^)]*)\)"#
     ).unwrap()
-});
-
-// Rust: also capture the extractor type names from the same function
-pub static RUST_EXTRACTOR_TYPES_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"\b(State|Extension|AuthUser|LpAuthUser|CurrentUser|AdminUser|Claims|JwtClaims)\b"#).unwrap()
 });
 
 // Python/FastAPI: Depends(some_func) in function signature
