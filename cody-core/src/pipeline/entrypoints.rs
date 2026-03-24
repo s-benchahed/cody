@@ -64,13 +64,23 @@ pub fn detect(all_facts: &[ExtractedFacts], min_confidence: f64) -> Vec<EntryPoi
         }
     }
 
-    // Route path propagation
-    let route_paths: Vec<(String, String, String)> = map.values()
+    // Route path propagation: carry path + method + middleware from router files to handler files
+    let route_paths: Vec<(String, String, String, Vec<String>)> = map.values()
         .filter(|ep| ep.path.is_some() && ep.kind == "route")
-        .map(|ep| (ep.fn_name.clone(), ep.path.clone().unwrap(), ep.method.clone().unwrap_or_default()))
+        .map(|ep| (
+            ep.fn_name.clone(),
+            ep.path.clone().unwrap(),
+            ep.method.clone().unwrap_or_default(),
+            ep.middleware.clone(),
+        ))
         .collect();
 
-    for (fn_name, path, method) in &route_paths {
+    // Track which (fn_name, router_file) pairs had their path successfully propagated
+    // to a different file (the actual handler file). These router-file entries are
+    // synthetic — the function isn't defined there — and should be removed.
+    let mut to_remove: HashSet<(String, String)> = HashSet::new();
+
+    for (fn_name, path, method, middleware) in &route_paths {
         if let Some(files) = symbol_files.get(fn_name) {
             for actual_file in files {
                 let key = (fn_name.clone(), actual_file.clone());
@@ -78,13 +88,36 @@ pub fn detect(all_facts: &[ExtractedFacts], min_confidence: f64) -> Vec<EntryPoi
                     if ep.path.is_none() {
                         ep.path   = Some(path.clone());
                         ep.method = Some(method.clone());
+                        // Route registration middleware (with_lp_auth, with_admin_auth)
+                        // takes priority over extractor types (State, LpAuthUser)
+                        if !middleware.is_empty() {
+                            ep.middleware = middleware.clone();
+                        }
+                        if ep.kind == "leaf" { ep.kind = "route".into(); }
                         if !ep.heuristics.contains(&"route_decorator".to_string()) {
                             ep.heuristics.push("route_decorator".into());
                         }
+                        // Mark the router-file entry for removal (it's a reference, not a definition)
+                        // Only remove if the actual handler file differs from the hint file
+                        // (identified by it being absent from symbol_files or in a different file)
                     }
+                    // If we found the symbol in actual_file and it differs from the route hint file,
+                    // the route hint entries for this fn_name in OTHER files should be cleaned up.
+                }
+            }
+            // Remove router-file entries for this fn_name that are NOT in symbol_files
+            // (i.e., the symbol is not defined there — it's just a router registration)
+            let defined_files: HashSet<&String> = files.iter().collect();
+            for ((k_fn, k_file), _) in map.iter() {
+                if k_fn == fn_name && !defined_files.contains(k_file) {
+                    to_remove.insert((k_fn.clone(), k_file.clone()));
                 }
             }
         }
+    }
+
+    for key in &to_remove {
+        map.remove(key);
     }
 
     map.into_values()

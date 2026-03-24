@@ -122,6 +122,16 @@ impl LanguagePlugin for RustPlugin {
                 if key_raw.is_empty() { continue; }
                 let key_norm = crate::patterns::normalise_key(&key_raw);
                 let (medium, direction) = rust_classify(&pattern);
+                // Reclassify redis reads that are actually HTTP header reads.
+                // Headers.get("key") matches redis_get pattern (identifier receiver)
+                // but the key name reveals it's an HTTP header, not a redis key.
+                let (medium, direction) = if medium == "redis" && direction == "read"
+                    && is_http_header_name(&key_raw)
+                {
+                    ("http_header".to_string(), "read".to_string())
+                } else {
+                    (medium, direction)
+                };
                 events.push(BoundaryEvent {
                     fn_name: "<module>".into(), file: file_str.clone(),
                     line: Some(key_cap.node.start_position().row as i64 + 1),
@@ -244,6 +254,23 @@ impl LanguagePlugin for RustPlugin {
         let imports = src.matches("use ").count();
         Ok(FileMetaCounts { lines, exports, imports })
     }
+}
+
+/// Returns true if the key looks like an HTTP header name rather than a redis key.
+/// HTTP headers are case-insensitive, typically hyphenated, and have well-known names.
+fn is_http_header_name(key: &str) -> bool {
+    let k = key.to_lowercase();
+    // Standard and common custom HTTP headers
+    const KNOWN: &[&str] = &[
+        "authorization", "content-type", "content-length", "accept",
+        "accept-language", "accept-encoding", "cache-control", "connection",
+        "host", "origin", "referer", "user-agent", "cookie", "set-cookie",
+        "location", "etag", "if-none-match", "if-modified-since",
+        "last-modified", "vary", "access-control-allow-origin",
+    ];
+    if KNOWN.contains(&k.as_str()) { return true; }
+    // Custom headers conventionally start with "x-"
+    k.starts_with("x-")
 }
 
 fn rust_classify(pattern: &str) -> (String, String) {

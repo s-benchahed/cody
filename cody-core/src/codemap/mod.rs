@@ -67,16 +67,20 @@ pub fn build(
         data.entries.push(ServiceEntry { ep: ep.clone(), io });
     }
 
-    // Build topology from grpc events
+    // Build topology from grpc/kafka events — only between services that have entry points
+    let real_services: HashSet<String> = services.keys().cloned().collect();
+
     let mut topo_set: HashSet<(String, String, String, String)> = HashSet::new();
     for facts in all_facts {
         let src_svc = service_from_path(&facts.file);
+        if !real_services.contains(&src_svc) { continue; }
         for ev in &facts.boundary_events {
-            if ev.medium != "grpc" || ev.prov_confidence < config.min_confidence { continue; }
-            // Find which other service defines this type
+            if !["grpc", "kafka"].contains(&ev.medium.as_str()) { continue; }
+            if ev.prov_confidence < config.min_confidence { continue; }
+            // Find which other real service mentions this type
             for other_facts in all_facts {
                 let dst_svc = service_from_path(&other_facts.file);
-                if dst_svc == src_svc { continue; }
+                if dst_svc == src_svc || !real_services.contains(&dst_svc) { continue; }
                 let matches = other_facts.boundary_events.iter()
                     .any(|e| e.key_raw == ev.key_raw)
                     || other_facts.symbols.iter().any(|s| s.name == ev.key_raw);

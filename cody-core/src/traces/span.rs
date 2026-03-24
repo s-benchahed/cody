@@ -66,6 +66,8 @@ pub fn service_from_path(file: &str) -> String {
     const SKIP: &[&str] = &[
         "src", "lib", "app", "test", "tests", "spec", "pkg",
         "internal", "cmd", "bin", "scripts", "utils", "helpers",
+        "handlers", "services", "controllers", "routes", "middleware",
+        "views", "models", "serializers", "resolvers",
     ];
     dir_parts.iter().rev()
         .find(|c| !SKIP.contains(&c.as_str()))
