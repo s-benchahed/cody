@@ -35,7 +35,7 @@ impl LanguagePlugin for PythonPlugin {
                     // In Python, exported = not starting with _
                     let is_exported = !name.starts_with('_');
                     symbols.push(Symbol {
-                        id: None, name,
+                        name,
                         kind: if is_class { "class" } else { "function" }.to_string(),
                         file: file_str.clone(),
                         line: Some(cap.node.start_position().row as i64 + 1),
@@ -66,7 +66,7 @@ impl LanguagePlugin for PythonPlugin {
                     });
                     if let Some(cap) = cap {
                         edges.push(Edge {
-                            id: None, src_file: Some(file_str.clone()), src_symbol: None,
+                            src_file: Some(file_str.clone()), src_symbol: None,
                             rel: "calls".into(), dst_file: None,
                             dst_symbol: Some(node_text(&cap.node, source).to_string()),
                             context: None, line: Some(cap.node.start_position().row as i64 + 1),
@@ -80,7 +80,7 @@ impl LanguagePlugin for PythonPlugin {
                     });
                     if let Some(cap) = cap {
                         edges.push(Edge {
-                            id: None, src_file: Some(file_str.clone()), src_symbol: None,
+                            src_file: Some(file_str.clone()), src_symbol: None,
                             rel: "imports".into(),
                             dst_file: Some(node_text(&cap.node, source).to_string()),
                             dst_symbol: None, context: None,
@@ -93,7 +93,7 @@ impl LanguagePlugin for PythonPlugin {
                     let parent = m.captures.iter().find(|c| query.capture_names()[c.index as usize] == "parent");
                     if let (Some(c), Some(p)) = (child, parent) {
                         edges.push(Edge {
-                            id: None, src_file: Some(file_str.clone()),
+                            src_file: Some(file_str.clone()),
                             src_symbol: Some(node_text(&c.node, source).to_string()),
                             rel: "extends".into(), dst_file: None,
                             dst_symbol: Some(node_text(&p.node, source).to_string()),
@@ -137,7 +137,7 @@ impl LanguagePlugin for PythonPlugin {
                 let fn_name = fn_cap.map(|c| node_text(&c.node, source).to_string())
                     .unwrap_or_else(|| "<module>".to_string());
                 events.push(BoundaryEvent {
-                    id: None, fn_name, file: file_str.clone(),
+                    fn_name, file: file_str.clone(),
                     line: Some(key_cap.node.start_position().row as i64 + 1),
                     direction, medium, key_raw, key_norm,
                     local_var: None, raw_context: None,
@@ -244,7 +244,7 @@ impl LanguagePlugin for PythonPlugin {
         let src = std::str::from_utf8(source).unwrap_or("");
         let exports = src.matches("def ").count() as i64;
         let imports = src.matches("import ").count() as i64 + src.matches("from ").count() as i64;
-        Ok(FileMetaCounts { line_count: lines, export_count: exports, import_count: imports })
+        Ok(FileMetaCounts { lines: lines as usize, exports: exports as usize, imports: imports as usize })
     }
 }
 

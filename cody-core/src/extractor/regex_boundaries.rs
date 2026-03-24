@@ -251,7 +251,6 @@ fn make_event(
     local_var: Option<&str>,
 ) -> BoundaryEvent {
     BoundaryEvent {
-        id: None,
         fn_name: fn_name.to_string(),
         file: file.to_string(),
         line,

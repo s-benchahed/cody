@@ -4,10 +4,10 @@ pub mod servers;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use anyhow::Result;
-use rusqlite::Connection;
 
 use client::LspClient;
 use servers::ServerSpec;
+use crate::db::models::BoundaryEvent;
 
 #[derive(Debug, Default)]
 pub struct LspStats {
@@ -17,70 +17,112 @@ pub struct LspStats {
     pub servers_started:  usize,
 }
 
+struct VerifiableRef {
+    idx:      usize,
+    file:     String,
+    language: String,
+    line:     Option<i64>,
+    medium:   String,
+    key_raw:  String,
+}
+
+fn lang_for_file(file: &str) -> String {
+    let ext = std::path::Path::new(file)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext {
+        "rs" => "rust".to_string(),
+        "ts" | "tsx" => "typescript".to_string(),
+        "js" | "jsx" | "mjs" | "cjs" => "javascript".to_string(),
+        "py" => "python".to_string(),
+        _ => ext.to_string(),
+    }
+}
+
 /// Enrich boundary events using LSP hover queries.
-///
-/// For each AST-sourced boundary event with a line number, spawn the
-/// appropriate language server, hover over the receiver object, and
-/// check whether its type matches the expected medium. Confirmed events
-/// get prov_confidence bumped to 0.97; rejected events drop to 0.15.
 pub async fn enrich_boundary_events(
-    conn: &Connection,
+    events: Vec<BoundaryEvent>,
     root_dir: &Path,
-) -> Result<LspStats> {
+) -> Result<(Vec<BoundaryEvent>, LspStats)> {
     let mut stats = LspStats::default();
 
     let available = servers::detect();
     if available.is_empty() {
         tracing::info!("LSP: no language servers found in PATH — skipping enrichment");
-        return Ok(stats);
+        return Ok((events, stats));
     }
     tracing::info!("LSP: found servers for: {}", available.keys().cloned().collect::<Vec<_>>().join(", "));
 
-    // Load verifiable events: AST-sourced, has line, medium is actionable
-    let events = load_verifiable_events(conn)?;
-    if events.is_empty() { return Ok(stats); }
+    // Filter verifiable events: AST-sourced, has line, medium is actionable
+    let verifiable_refs: Vec<VerifiableRef> = events.iter().enumerate()
+        .filter(|(_, ev)| {
+            ev.prov_source == "ast"
+            && ev.line.is_some()
+            && matches!(ev.medium.as_str(), "redis"|"kafka"|"sql"|"http_header")
+        })
+        .map(|(idx, ev)| VerifiableRef {
+            idx,
+            file: ev.file.clone(),
+            language: lang_for_file(&ev.file),
+            line: ev.line,
+            medium: ev.medium.clone(),
+            key_raw: ev.key_raw.clone(),
+        })
+        .collect();
+
+    if verifiable_refs.is_empty() { return Ok((events, stats)); }
 
     // Group events by (language, file)
-    let mut by_lang: HashMap<String, Vec<EventRow>> = HashMap::new();
-    for ev in events {
-        by_lang.entry(ev.language.clone()).or_default().push(ev);
+    let mut by_lang: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, vr) in verifiable_refs.iter().enumerate() {
+        by_lang.entry(vr.language.clone()).or_default().push(i);
     }
 
-    for (lang, lang_events) in &by_lang {
+    // Collect updates: (index into events, new_confidence, note)
+    let mut updates: Vec<(usize, f64, String)> = Vec::new();
+
+    for (lang, lang_indices) in &by_lang {
         let Some(spec) = available.get(lang.as_str()) else { continue };
 
-        // Group events by workspace root (nearest Cargo.toml / package.json / etc.)
-        // so each LSP server is started with the correct workspace.
-        let mut by_workspace: HashMap<PathBuf, Vec<&EventRow>> = HashMap::new();
-        for ev in lang_events {
-            let file = Path::new(&ev.file);
-            let ws = find_workspace_root(file, &lang)
+        let mut by_workspace: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+        for &i in lang_indices {
+            let file = Path::new(&verifiable_refs[i].file);
+            let ws = find_workspace_root(file, lang)
                 .unwrap_or_else(|| root_dir.to_path_buf());
-            by_workspace.entry(ws).or_default().push(ev);
+            by_workspace.entry(ws).or_default().push(i);
         }
 
-        for (workspace, ws_events) in &by_workspace {
+        for (workspace, ws_indices) in &by_workspace {
+            let ws_events: Vec<&VerifiableRef> = ws_indices.iter().map(|&i| &verifiable_refs[i]).collect();
             tracing::info!("LSP: starting {} for workspace {}", spec.binary, workspace.display());
-            match process_language(conn, workspace, spec, ws_events, &mut stats).await {
-                Ok(()) => {}
+            match process_language(workspace, spec, &ws_events, &mut stats).await {
+                Ok(mut batch_updates) => updates.append(&mut batch_updates),
                 Err(e) => tracing::warn!("LSP enrichment failed for {lang} @ {}: {e}", workspace.display()),
             }
         }
     }
 
-    Ok(stats)
+    // Apply updates to events vec
+    let mut events = events;
+    for (idx, confidence, note) in updates {
+        if let Some(ev) = events.get_mut(idx) {
+            ev.prov_confidence = confidence;
+            ev.prov_note = Some(note);
+        }
+    }
+
+    Ok((events, stats))
 }
 
 // ── workspace root detection ────────────────────────────────────────────────
 
-/// Walk up from a file to find the nearest directory containing the language's
-/// workspace manifest (Cargo.toml, package.json, pyproject.toml, etc.).
 fn find_workspace_root(file: &Path, language: &str) -> Option<PathBuf> {
     let manifests: &[&str] = match language {
-        "rust"                   => &["Cargo.toml"],
+        "rust"                      => &["Cargo.toml"],
         "typescript" | "javascript" => &["tsconfig.json", "package.json"],
-        "python"                 => &["pyproject.toml", "setup.cfg", "setup.py", "requirements.txt"],
-        _                        => return None,
+        "python"                    => &["pyproject.toml", "setup.cfg", "setup.py", "requirements.txt"],
+        _                           => return None,
     };
     let mut dir = file.parent()?;
     loop {
@@ -99,17 +141,18 @@ fn find_workspace_root(file: &Path, language: &str) -> Option<PathBuf> {
 // ── per-language processing ─────────────────────────────────────────────────
 
 async fn process_language(
-    conn: &Connection,
     root_dir: &Path,
     spec: &ServerSpec,
-    events: &[&EventRow],
+    events: &[&VerifiableRef],
     stats: &mut LspStats,
-) -> Result<()> {
+) -> Result<Vec<(usize, f64, String)>> {
     let mut lsp = LspClient::spawn(spec.binary, spec.args, root_dir).await?;
     stats.servers_started += 1;
 
+    let mut updates: Vec<(usize, f64, String)> = Vec::new();
+
     // Group by file so we open each file once
-    let mut by_file: HashMap<&str, Vec<&EventRow>> = HashMap::new();
+    let mut by_file: HashMap<&str, Vec<&VerifiableRef>> = HashMap::new();
     for ev in events {
         by_file.entry(ev.file.as_str()).or_default().push(ev);
     }
@@ -129,7 +172,6 @@ async fn process_language(
             let line_0 = (line_1based - 1).max(0) as usize;
             let Some(&line_text) = lines.get(line_0) else { continue };
 
-            // Find the column of the receiver object on this line
             let Some(col) = find_receiver_col(line_text, &ev.medium) else { continue };
 
             stats.events_checked += 1;
@@ -143,11 +185,11 @@ async fn process_language(
                     );
                     match verdict {
                         HoverVerdict::Confirmed => {
-                            update_event(conn, ev.id, 0.97, "lsp:confirmed")?;
+                            updates.push((ev.idx, 0.97, "lsp:confirmed".to_string()));
                             stats.events_confirmed += 1;
                         }
                         HoverVerdict::Rejected => {
-                            update_event(conn, ev.id, 0.15, "lsp:rejected")?;
+                            updates.push((ev.idx, 0.15, "lsp:rejected".to_string()));
                             stats.events_rejected += 1;
                         }
                         HoverVerdict::Unknown => {}
@@ -160,7 +202,7 @@ async fn process_language(
     }
 
     lsp.shutdown().await.ok();
-    Ok(())
+    Ok(updates)
 }
 
 // ── hover type classification ───────────────────────────────────────────────
@@ -170,31 +212,22 @@ enum HoverVerdict { Confirmed, Rejected, Unknown }
 
 fn classify_hover(text: &str, medium: &str) -> HoverVerdict {
     let t = text.to_lowercase();
-    // When a typed language server (TS, Rust) returns a hover, the type is authoritative.
-    // If the type doesn't contain our target keyword, the object is definitely not that medium.
-    // rust-analyzer may return plain text or markdown depending on content format negotiation.
-    // TypeScript-language-server and pyright always return markdown-wrapped type annotations.
-    // rust-analyzer may return plaintext; handled per-medium with known Rust type names.
     let is_ts_typed = t.contains("```typescript");
     let is_py_typed = t.contains("```python");
     let is_typed_hover = t.contains("```rust") || is_ts_typed || is_py_typed;
     match medium {
         "redis" => {
             let redis_types = ["redis", "ioredis", "redisclient", "connectionpool", "strictredis"];
-            // Known non-Redis types: DB rows, JSON values, HTTP types, common Rust/TS types
             let non_redis = [
                 "map<", "dict[", "hashmap<", "btreemap<", "object", "any",
-                // Rust (sqlx, actix, serde)
                 "pgrow", "sqliterow", "mysqlrow", "row", "pgpool", "headermap",
                 "value", "jsonvalue", "serde_json",
-                // TypeScript common non-Redis
                 "urlsearchparams", "string", "number", "boolean", "undefined", "null",
                 "import", "function", "array", "promise",
             ];
             if redis_types.iter().any(|p| t.contains(p)) {
                 HoverVerdict::Confirmed
             } else if is_typed_hover {
-                // Typed TS/Rust with markdown blocks → reject if no Redis keyword
                 HoverVerdict::Rejected
             } else if non_redis.iter().any(|p| t.contains(p)) {
                 HoverVerdict::Rejected
@@ -246,8 +279,6 @@ fn classify_hover(text: &str, medium: &str) -> HoverVerdict {
     }
 }
 
-/// Find the 0-based column of the receiver object in a source line for the given medium.
-/// Looks for patterns like `obj.get(`, `obj.set(`, `obj.publish(`, etc.
 fn find_receiver_col(line: &str, medium: &str) -> Option<usize> {
     let method_patterns: &[&str] = match medium {
         "redis"       => &["get(", "set(", "hget(", "hset(", "del(", "setex(", "lpush("],
@@ -259,10 +290,8 @@ fn find_receiver_col(line: &str, medium: &str) -> Option<usize> {
 
     for pat in method_patterns {
         if let Some(idx) = line.find(pat) {
-            // Walk backwards from the `.` before the method name to find the object identifier
             let before_dot = idx.saturating_sub(1);
             if line.as_bytes().get(before_dot) == Some(&b'.') {
-                // Find the start of the identifier before the dot
                 let start = line[..before_dot]
                     .rfind(|c: char| !c.is_alphanumeric() && c != '_')
                     .map(|i| i + 1)
@@ -274,46 +303,4 @@ fn find_receiver_col(line: &str, medium: &str) -> Option<usize> {
         }
     }
     None
-}
-
-// ── DB helpers ──────────────────────────────────────────────────────────────
-
-struct EventRow {
-    id:       i64,
-    file:     String,
-    language: String,
-    line:     Option<i64>,
-    medium:   String,
-    key_raw:  String,
-}
-
-fn load_verifiable_events(conn: &Connection) -> Result<Vec<EventRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT be.id, be.file, COALESCE(fm.language,''), be.line, be.medium, be.key_raw
-         FROM boundary_events be
-         LEFT JOIN file_meta fm ON fm.file = be.file
-         WHERE be.prov_source = 'ast'
-           AND be.line IS NOT NULL
-           AND be.medium IN ('redis','kafka','sql','http_header')
-         ORDER BY be.file, be.line"
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(EventRow {
-            id:       r.get(0)?,
-            file:     r.get(1)?,
-            language: r.get(2)?,
-            line:     r.get(3)?,
-            medium:   r.get(4)?,
-            key_raw:  r.get(5)?,
-        })
-    })?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
-}
-
-fn update_event(conn: &Connection, id: i64, confidence: f64, note: &str) -> Result<()> {
-    conn.execute(
-        "UPDATE boundary_events SET prov_confidence = ?1, prov_note = ?2 WHERE id = ?3",
-        rusqlite::params![confidence, note, id],
-    )?;
-    Ok(())
 }

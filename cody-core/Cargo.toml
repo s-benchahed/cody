@@ -14,8 +14,6 @@ tree-sitter-python     = "0.21"
 tree-sitter-ruby       = "0.21"
 tree-sitter-rust       = "0.21"
 
-rusqlite             = { version = "0.31", features = ["bundled"] }
-
 rayon                = "1.10"
 walkdir              = "2.5"
 sha2                 = "0.10"

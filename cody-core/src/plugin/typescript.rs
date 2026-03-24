@@ -54,7 +54,7 @@ impl LanguagePlugin for TypeScriptPlugin {
                         "function"
                     }.to_string();
                     symbols.push(Symbol {
-                        id: None, name, kind, file: file_str.clone(),
+                        name, kind, file: file_str.clone(),
                         line: Some(cap.node.start_position().row as i64 + 1),
                         signature: None, is_exported: is_export,
                         prov_source: "ast".into(), prov_confidence: 0.95,
@@ -87,7 +87,7 @@ impl LanguagePlugin for TypeScriptPlugin {
                     });
                     if let Some(cap) = cap {
                         edges.push(Edge {
-                            id: None, src_file: Some(file_str.clone()), src_symbol: None,
+                            src_file: Some(file_str.clone()), src_symbol: None,
                             rel: "calls".into(), dst_file: None,
                             dst_symbol: Some(node_text(&cap.node, source).to_string()),
                             context: None,
@@ -103,7 +103,7 @@ impl LanguagePlugin for TypeScriptPlugin {
                         let raw = node_text(&cap.node, source);
                         let path = raw.trim_matches(|c| c == '"' || c == '\'').to_string();
                         edges.push(Edge {
-                            id: None, src_file: Some(file_str.clone()), src_symbol: None,
+                            src_file: Some(file_str.clone()), src_symbol: None,
                             rel: "imports".into(), dst_file: Some(path), dst_symbol: None,
                             context: None, line: Some(cap.node.start_position().row as i64 + 1),
                         });
@@ -144,7 +144,7 @@ impl LanguagePlugin for TypeScriptPlugin {
                 let key_norm = crate::patterns::normalise_key(&key_raw);
                 let (medium, direction) = classify(&pattern_name);
                 events.push(BoundaryEvent {
-                    id: None, fn_name: "<module>".into(), file: file_str.clone(),
+                    fn_name: "<module>".into(), file: file_str.clone(),
                     line: Some(key_cap.node.start_position().row as i64 + 1),
                     direction, medium, key_raw, key_norm,
                     local_var: None, raw_context: None,
@@ -218,7 +218,7 @@ impl LanguagePlugin for TypeScriptPlugin {
         let src = std::str::from_utf8(source).unwrap_or("");
         let exports = src.matches("export ").count() as i64;
         let imports = src.matches("import ").count() as i64;
-        Ok(FileMetaCounts { line_count: lines, export_count: exports, import_count: imports })
+        Ok(FileMetaCounts { lines: lines as usize, exports: exports as usize, imports: imports as usize })
     }
 }
 

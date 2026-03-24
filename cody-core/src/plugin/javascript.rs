@@ -34,7 +34,7 @@ impl LanguagePlugin for JavaScriptPlugin {
                     if name.is_empty() { continue; }
                     let kind = if cap_name.contains("class") { "class" } else { "function" }.to_string();
                     symbols.push(Symbol {
-                        id: None, name, kind, file: file_str.clone(),
+                        name, kind, file: file_str.clone(),
                         line: Some(cap.node.start_position().row as i64 + 1),
                         signature: None,
                         is_exported: is_export,
@@ -65,7 +65,7 @@ impl LanguagePlugin for JavaScriptPlugin {
                     });
                     if let Some(cap) = callee_cap {
                         edges.push(Edge {
-                            id: None, src_file: Some(file_str.clone()), src_symbol: None,
+                            src_file: Some(file_str.clone()), src_symbol: None,
                             rel: "calls".into(),
                             dst_file: None,
                             dst_symbol: Some(node_text(&cap.node, source).to_string()),
@@ -82,7 +82,7 @@ impl LanguagePlugin for JavaScriptPlugin {
                         let raw = node_text(&cap.node, source);
                         let path = raw.trim_matches(|c| c == '"' || c == '\'').to_string();
                         edges.push(Edge {
-                            id: None, src_file: Some(file_str.clone()), src_symbol: None,
+                            src_file: Some(file_str.clone()), src_symbol: None,
                             rel: "imports".into(),
                             dst_file: Some(path),
                             dst_symbol: None, context: None,
@@ -95,7 +95,7 @@ impl LanguagePlugin for JavaScriptPlugin {
                     let parent = m.captures.iter().find(|c| query.capture_names()[c.index as usize] == "parent");
                     if let (Some(child), Some(parent)) = (child, parent) {
                         edges.push(Edge {
-                            id: None, src_file: Some(file_str.clone()),
+                            src_file: Some(file_str.clone()),
                             src_symbol: Some(node_text(&child.node, source).to_string()),
                             rel: "extends".into(), dst_file: None,
                             dst_symbol: Some(node_text(&parent.node, source).to_string()),
@@ -124,7 +124,7 @@ impl LanguagePlugin for JavaScriptPlugin {
         let exports = src_str.matches("export ").count() as i64;
         let imports = src_str.matches("import ").count() as i64
             + src_str.matches("require(").count() as i64;
-        Ok(FileMetaCounts { line_count: lines, export_count: exports, import_count: imports })
+        Ok(FileMetaCounts { lines: lines as usize, exports: exports as usize, imports: imports as usize })
     }
 }
 
@@ -161,7 +161,7 @@ pub fn extract_js_boundaries(
             let (medium, direction) = classify_boundary(&pattern_name);
             let fn_name = enclosing_function(key_cap.node, source);
             events.push(BoundaryEvent {
-                id: None, fn_name, file: file_str.clone(),
+                fn_name, file: file_str.clone(),
                 line: Some(key_cap.node.start_position().row as i64 + 1),
                 direction, medium, key_raw, key_norm,
                 local_var: None,

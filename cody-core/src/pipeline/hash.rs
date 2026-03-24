@@ -1,9 +1,8 @@
 use std::fs;
+use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 use rayon::prelude::*;
-use rusqlite::Connection;
 use crate::pipeline::walk::FileEntry;
-use crate::db::store::get_file_hash;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChangeStatus {
@@ -20,17 +19,15 @@ pub struct HashedFile {
     pub status:  ChangeStatus,
 }
 
-pub fn hash_files(entries: &[FileEntry], conn: &Connection) -> Vec<HashedFile> {
-    // Pre-load all known hashes to avoid per-file DB queries in parallel
-    let known: std::collections::HashMap<String, String> = {
-        let mut m = std::collections::HashMap::new();
-        for e in entries {
-            let key = e.path.to_string_lossy().to_string();
-            if let Ok(Some(h)) = get_file_hash(conn, &key) {
-                m.insert(key, h);
-            }
+pub fn hash_files_cached(entries: &[FileEntry], cache_path: &std::path::Path) -> Vec<HashedFile> {
+    // Load cached hashes from JSON file if it exists
+    let known: HashMap<String, String> = if cache_path.exists() {
+        match fs::read_to_string(cache_path) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+            Err(_) => HashMap::new(),
         }
-        m
+    } else {
+        HashMap::new()
     };
 
     entries.par_iter().filter_map(|entry| {
@@ -46,4 +43,20 @@ pub fn hash_files(entries: &[FileEntry], conn: &Connection) -> Vec<HashedFile> {
         };
         Some(HashedFile { entry: entry.clone(), source, sha256, status })
     }).collect()
+}
+
+pub fn save_cache(hashed: &[HashedFile], cache_path: &std::path::Path) {
+    let map: HashMap<String, String> = hashed.iter()
+        .map(|h| (h.entry.path.to_string_lossy().to_string(), h.sha256.clone()))
+        .collect();
+    if let Ok(json) = serde_json::to_string(&map) {
+        let _ = fs::write(cache_path, json);
+    }
+}
+
+pub fn sha256_file(path: &std::path::Path) -> Option<String> {
+    let source = fs::read(path).ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&source);
+    Some(hex::encode(hasher.finalize()))
 }

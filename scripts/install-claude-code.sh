@@ -23,7 +23,7 @@ fi
 # Detect jq availability
 if command -v jq &>/dev/null; then
     # Use jq to safely merge permissions
-    PERMS_TO_ADD='["Bash(cody:*)","Bash(./target/release/cody:*)","Bash(sqlite3:*)"]'
+    PERMS_TO_ADD='["Bash(cody:*)","Bash(./target/release/cody:*)"]'
     UPDATED=$(jq \
         --argjson new "$PERMS_TO_ADD" \
         '.permissions.allow = ((.permissions.allow // []) + $new | unique)' \
@@ -34,7 +34,6 @@ else
     echo "  ! jq not found — add these permissions to $SETTINGS_FILE manually:"
     echo '    "Bash(cody:*)"'
     echo '    "Bash(./target/release/cody:*)"'
-    echo '    "Bash(sqlite3:*)"'
 fi
 
 # ── 3. Check binary availability ─────────────────────────────────────────────
@@ -48,5 +47,8 @@ else
 fi
 
 echo ""
-echo "Done. Start a new Claude Code session and try:"
+echo "Done. Generate a codemap for your project:"
+echo "  cody ./my-project --out codemap.md"
+echo ""
+echo "Then start a Claude Code session and try:"
 echo "  /cody how does authentication work in this project?"

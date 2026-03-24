@@ -2,9 +2,9 @@
 
 A static codebase semantic indexer for multi-language, multi-service repositories.
 
-cody extracts a structured index from source code using tree-sitter — no LLM during indexing. The index captures symbols, call graphs, I/O boundaries, HTTP routes, middleware, and gRPC flows. LLM is only used at query time (optional `search` command).
+cody scans source code using tree-sitter and produces a single `codemap.md` file — no LLM during indexing. The codemap captures HTTP routes, I/O boundaries (redis, sql, kafka, grpc), middleware/auth, and cross-service data flows, organized by service.
 
-**Best used alongside code reading, not as a replacement.** cody orients you quickly — find the right files, understand service dependencies, trace execution paths — then you read the targeted files for detail.
+**Best used alongside code reading, not as a replacement.** cody orients you quickly — understand service dependencies, see all routes and their auth, trace what each endpoint reads and writes — then read the targeted source files for detail.
 
 ---
 
@@ -44,71 +44,64 @@ Requires Rust 1.75+.
 ## Quick start
 
 ```bash
-# 1. Index your project
-cody index ./my-project --db my-project.db
+# Generate codemap for your project
+cody ./my-project --out codemap.md
 
-# 2. See what's in it
-cody query --db my-project.db stats
+# Or with LSP verification (removes false positives):
+cody ./my-project --out codemap.md --lsp
 
-# 3. Explore
-cody query --db my-project.db topology
-cody query --db my-project.db traces <entry-point-fn>
-cody query --db my-project.db medium redis
+# Then read it
+cat codemap.md
 ```
 
 ---
 
 ## CLI reference
 
-### `cody index`
-
 ```
-cody index <dir> [OPTIONS]
+cody <dir> [OPTIONS]
 
 Options:
-  --db <path>            SQLite output path [default: index.db]
+  --out <path>           Output file path [default: codemap.md]
   --depth <n>            Max call graph depth [default: 6]
   --lsp                  Enable LSP type verification (removes false positives)
   --min-confidence <f>   Minimum confidence threshold [default: 0.5]
-  --all-entrypoints      Include low-confidence entry points in traces
-  --skip-embed           Skip embedding step
 ```
 
-Re-running on the same directory is incremental — only changed files are reprocessed.
+Re-running on the same directory is incremental — only changed files are reprocessed (cached in `.cody-cache`).
 
-### `cody query --db <path> <COMMAND>`
+---
 
-> **Note:** `--db` must come before the subcommand, not after.
-
-| Command | Args | Description |
-|---|---|---|
-| `stats` | | Row counts for all tables |
-| `lookup` | `<name>` | Find symbol definition. Falls back to fuzzy substring match. |
-| `callers` | `<symbol>` | What functions call this symbol |
-| `callees` | `<symbol>` | What this symbol calls |
-| `deps` | `<file>` | File-level import dependencies |
-| `path` | `<from> <to>` | Shortest call path between two functions |
-| `boundaries` | `<fn>` | I/O operations (redis/sql/kafka/grpc) touched by a function |
-| `medium` | `<medium>` | All boundary events for a given medium across the codebase |
-| `cross` | `<svc_a> <svc_b>` | Keys written by service A and read by service B |
-| `traces` | `<fn>` | Full execution trace from an entry point |
-| `topology` | | Service dependency graph derived from boundary flows |
-
-### `cody embed`
+## Output format
 
 ```
-cody embed --db <path> --api-key $OPENAI_API_KEY [--model text-embedding-3-small]
+# Codemap — my-project
+Generated: 2026-03-23 | Files: 350 | Languages: rust, typescript
+
+## Service Topology
+service     →  handlers    grpc: GetProfileRequest
+client-app  →  service     grpc: LoginRequest, DeleteAccountRequest
+
+## service [rust]
+
+### Public
+POST /login
+  in:   body{LoginRequest}
+  redis:  reads x-timezone
+  grpc: → (response)
+
+### [auth: with_lp_auth]
+POST /feed/get
+  in:   body{GetFeedRequest}
+  redis:  reads authorization, x-timezone
+  grpc: → (request), → (response)
+
+### Background
+lp_auth_middleware
+  redis:  reads authorization, x-timezone
 ```
 
-Embeds all traces using the OpenAI embeddings API. Required before `search`.
-
-### `cody search`
-
-```
-cody search --db <path> --api-key $ANTHROPIC_API_KEY "<question>"
-```
-
-Natural language search over indexed traces using Claude.
+Routes are grouped by service, then by auth middleware (Public / `[auth: X]` / Background).
 
 ---
 
@@ -144,45 +137,23 @@ See [`docs/claude-code.md`](docs/claude-code.md) for a one-command setup that ad
 ## How it works
 
 ```
-[1] Walk         Find all source files matching supported extensions
-[2] Hash         SHA-256 each file, skip unchanged (incremental)
-[3] Parse        tree-sitter parse per language
-[4] Extract      Symbols + call edges + boundary events + entry point hints
-[5] Ingest       Write to SQLite (one transaction per file)
-[6] LSP enrich   Optional: spawn language servers, hover-verify boundary types
-[7] Stitch       Match boundary writes to reads → boundary_flows table
-[8] Entrypoints  5 heuristics: exported leaves, route decorators, queue consumers,
-                 main functions, cron/scheduler annotations
-[9] Traces       DFS from each entry point up to configured depth → traces table
+[1] Walk      Find all source files matching supported extensions
+[2] Hash      SHA-256 each file, skip unchanged (incremental via .cody-cache)
+[3] Parse     tree-sitter parse per language
+[4] Extract   Symbols + call edges + boundary events + entry point hints
+[5] Enrich    Optional: spawn language servers, hover-verify boundary types
+[6] Assemble  Build adjacency map + boundary index + entry points (in-memory)
+[7] Write     Generate codemap.md
 ```
 
-Steps 3, 4, and 9 are parallelised with rayon. Steps 5 and 8 are sequential (SQLite writes).
-
----
-
-## Database schema
-
-The index is a plain SQLite file — query it directly with `sqlite3` for ad-hoc analysis.
-
-```sql
-symbols(id, name, kind, file, line, signature, is_exported, prov_source, prov_confidence)
-edges(id, src_file, src_symbol, rel, dst_file, dst_symbol, context, line)
-file_meta(file, language, lines, exports, imports, hash)
-boundary_events(id, fn_name, file, line, direction, medium, key_raw, key_norm,
-                local_var, raw_context, prov_source, prov_confidence, prov_plugin, prov_note)
-boundary_flows(id, write_fn, write_file, read_fn, read_file, medium, key_norm, confidence)
-entry_points(id, fn_name, file, line, kind, framework, path, method,
-             confidence, heuristics, middleware)
-traces(id, trace_id, root_fn, root_file, service, text, compact, otlp,
-       span_count, fn_names, media, value_names, min_confidence, created_at)
-```
+Steps 3 and 4 are parallelised with rayon.
 
 ---
 
 ## Limitations
 
 - **No cross-file type inference without LSP** — boundary detection on dynamic languages (JS/Python/Ruby) may produce false positives without `--lsp`
-- **Traces require entry points** — if a function has no detected entry point, it won't appear in `traces`
+- **Coverage requires detected entry points** — functions with no detected entry point (not exported, no route, no main) won't appear in the codemap
 - **Go, Java, C/C++ not supported** — tree-sitter grammars exist but are not yet integrated
 - **No semantic deduplication** — two methods with the same name in different classes are treated separately
 

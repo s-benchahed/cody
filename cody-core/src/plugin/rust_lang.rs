@@ -38,7 +38,7 @@ impl LanguagePlugin for RustPlugin {
                         .and_then(|p| p.child_by_field_name("visibility"))
                         .is_some();
                     symbols.push(Symbol {
-                        id: None, name,
+                        name,
                         kind: if is_class { "class" } else { "function" }.to_string(),
                         file: file_str.clone(),
                         line: Some(node.start_position().row as i64 + 1),
@@ -71,7 +71,7 @@ impl LanguagePlugin for RustPlugin {
                         let name = node_text(&cap.node, source).to_string();
                         if !name.is_empty() {
                             edges.push(Edge {
-                                id: None, src_file: Some(file_str.clone()), src_symbol: None,
+                                src_file: Some(file_str.clone()), src_symbol: None,
                                 rel: "calls".into(), dst_file: None, dst_symbol: Some(name),
                                 context: None, line: Some(cap.node.start_position().row as i64 + 1),
                             });
@@ -82,7 +82,7 @@ impl LanguagePlugin for RustPlugin {
                     let cap = m.captures.iter().find(|c| query.capture_names()[c.index as usize] == "crate");
                     if let Some(cap) = cap {
                         edges.push(Edge {
-                            id: None, src_file: Some(file_str.clone()), src_symbol: None,
+                            src_file: Some(file_str.clone()), src_symbol: None,
                             rel: "imports".into(),
                             dst_file: Some(node_text(&cap.node, source).to_string()),
                             dst_symbol: None, context: None,
@@ -123,7 +123,7 @@ impl LanguagePlugin for RustPlugin {
                 let key_norm = crate::patterns::normalise_key(&key_raw);
                 let (medium, direction) = rust_classify(&pattern);
                 events.push(BoundaryEvent {
-                    id: None, fn_name: "<module>".into(), file: file_str.clone(),
+                    fn_name: "<module>".into(), file: file_str.clone(),
                     line: Some(key_cap.node.start_position().row as i64 + 1),
                     direction, medium, key_raw, key_norm,
                     local_var: None, raw_context: None,
@@ -238,11 +238,11 @@ impl LanguagePlugin for RustPlugin {
     }
 
     fn file_meta_counts(&self, _tree: &tree_sitter::Tree, source: &[u8]) -> Result<FileMetaCounts> {
-        let lines = source.iter().filter(|&&b| b == b'\n').count() as i64 + 1;
+        let lines = source.iter().filter(|&&b| b == b'\n').count() + 1;
         let src = std::str::from_utf8(source).unwrap_or("");
-        let exports = src.matches("pub fn ").count() as i64 + src.matches("pub struct ").count() as i64;
-        let imports = src.matches("use ").count() as i64;
-        Ok(FileMetaCounts { line_count: lines, export_count: exports, import_count: imports })
+        let exports = src.matches("pub fn ").count() + src.matches("pub struct ").count();
+        let imports = src.matches("use ").count();
+        Ok(FileMetaCounts { lines, exports, imports })
     }
 }
 

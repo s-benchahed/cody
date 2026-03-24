@@ -1,137 +1,106 @@
 pub mod walk;
 pub mod hash;
 pub mod parse;
-pub mod ingest;
 pub mod entrypoints;
-pub mod traces;
 
 use anyhow::Result;
 use rayon::prelude::*;
 use std::time::Instant;
-use crate::config::IndexConfig;
-use crate::db;
+use crate::config::MapConfig;
 use crate::extractor;
-use crate::patterns;
-use crate::traces::walker::TraceConfig;
+use crate::plugin::registry::build_registry;
+use crate::codemap;
 use hash::ChangeStatus;
 
-pub fn run_index(config: &IndexConfig) -> Result<()> {
-    let conn = db::open(&config.db_path)?;
-    let registry = crate::plugin::registry::build_registry();
+pub fn run_map(config: &MapConfig) -> Result<()> {
+    let registry = build_registry();
 
-    // ── Step 1: Walk ──────────────────────────────────────────────────────
     let t0 = Instant::now();
     let entries = walk::collect_files(&config.root_dir, &registry);
     tracing::info!("Found {} files in {:.1}s", entries.len(), t0.elapsed().as_secs_f32());
 
-    // ── Step 2: Hash check ────────────────────────────────────────────────
     let t1 = Instant::now();
-    let hashed = hash::hash_files(&entries, &conn);
-    let changed: Vec<_> = hashed.iter()
-        .filter(|h| h.status != ChangeStatus::Unchanged)
-        .collect();
+    let cache_path = config.root_dir.join(".cody-cache");
+    let hashed = hash::hash_files_cached(&entries, &cache_path);
     tracing::info!(
         "Hashed in {:.1}s: {} changed / {} new / {} unchanged",
         t1.elapsed().as_secs_f32(),
-        changed.iter().filter(|h| h.status == ChangeStatus::Changed).count(),
-        changed.iter().filter(|h| h.status == ChangeStatus::New).count(),
+        hashed.iter().filter(|h| h.status == ChangeStatus::Changed).count(),
+        hashed.iter().filter(|h| h.status == ChangeStatus::New).count(),
         hashed.iter().filter(|h| h.status == ChangeStatus::Unchanged).count(),
     );
 
-    if changed.is_empty() {
-        tracing::info!("Nothing changed. Index up to date.");
-        print_stats(&conn);
-        return Ok(());
-    }
-
-    let changed_owned: Vec<_> = changed.iter().map(|h| (*h).clone()).collect();
-
-    // ── Step 3: Parse ─────────────────────────────────────────────────────
     let t2 = Instant::now();
-    let parsed = parse::parse_files(&changed_owned, &registry);
+    let parsed = parse::parse_files(&hashed, &registry);
     tracing::info!("Parsed {} files in {:.1}s", parsed.len(), t2.elapsed().as_secs_f32());
 
-    // ── Step 4: Extract (parallel) ────────────────────────────────────────
     let t3 = Instant::now();
-    let facts: Vec<extractor::ExtractedFacts> = parsed.par_iter()
-        .filter_map(|pf| {
-            extractor::extract(pf).map_err(|e| {
-                tracing::warn!("extract error {}: {e}", pf.hashed.entry.path.display());
-                e
-            }).ok()
-        }).collect();
-    tracing::info!("Extracted {} files in {:.1}s", facts.len(), t3.elapsed().as_secs_f32());
+    let mut all_facts: Vec<extractor::ExtractedFacts> = parsed.par_iter()
+        .filter_map(|pf| extractor::extract(pf).map_err(|e| {
+            tracing::warn!("extract error {}: {e}", pf.hashed.entry.path.display()); e
+        }).ok())
+        .collect();
+    tracing::info!("Extracted {} files in {:.1}s", all_facts.len(), t3.elapsed().as_secs_f32());
 
-    // ── Step 5: Ingest (sequential) ───────────────────────────────────────
-    let t4 = Instant::now();
-    for f in &facts {
-        ingest::ingest_facts(&conn, f)?;
-    }
-    tracing::info!("Ingested in {:.1}s", t4.elapsed().as_secs_f32());
-
-    // ── Step 5b: Optional LSP enrichment ─────────────────────────────────
     if config.use_lsp {
         let t_lsp = Instant::now();
+        let all_events: Vec<_> = all_facts.iter()
+            .flat_map(|f| f.boundary_events.clone())
+            .collect();
         let lsp_result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(crate::lsp::enrich_boundary_events(&conn, &config.root_dir))
+                .block_on(crate::lsp::enrich_boundary_events(all_events, &config.root_dir))
         });
         match lsp_result {
-            Ok(s) => tracing::info!(
-                "LSP enrichment in {:.1}s: {} checked, {} confirmed, {} rejected",
-                t_lsp.elapsed().as_secs_f32(),
-                s.events_checked, s.events_confirmed, s.events_rejected,
-            ),
+            Ok((enriched, stats)) => {
+                tracing::info!(
+                    "LSP enrichment in {:.1}s: {} checked, {} confirmed, {} rejected",
+                    t_lsp.elapsed().as_secs_f32(),
+                    stats.events_checked, stats.events_confirmed, stats.events_rejected,
+                );
+                // Build lookup map for enriched events
+                let mut enriched_map: std::collections::HashMap<(String, String, String, String), (f64, Option<String>)> =
+                    std::collections::HashMap::new();
+                for ev in &enriched {
+                    enriched_map.insert(
+                        (ev.fn_name.clone(), ev.file.clone(), ev.medium.clone(), ev.key_norm.clone()),
+                        (ev.prov_confidence, ev.prov_note.clone()),
+                    );
+                }
+                for facts in &mut all_facts {
+                    for ev in &mut facts.boundary_events {
+                        if let Some((conf, note)) = enriched_map.get(&(
+                            ev.fn_name.clone(), ev.file.clone(), ev.medium.clone(), ev.key_norm.clone()
+                        )) {
+                            ev.prov_confidence = *conf;
+                            ev.prov_note = note.clone();
+                        }
+                    }
+                }
+            }
             Err(e) => tracing::warn!("LSP enrichment error: {e}"),
         }
     }
 
-    // ── Step 5c: Stitch boundary flows ────────────────────────────────────
-    let all_bounds = db::store::load_all_boundary_events(&conn)?;
-    let flows = patterns::stitch_boundary_events(&all_bounds, config.min_confidence);
-    conn.execute("DELETE FROM boundary_flows", [])?;
-    db::store::insert_boundary_flows(&conn, &flows)?;
-    tracing::info!("Stitched {} boundary flows", flows.len());
+    let entry_points = entrypoints::detect(&all_facts, config.min_confidence);
+    tracing::info!("Detected {} entry points", entry_points.len());
 
-    // ── Step 6: Entry point detection ────────────────────────────────────
-    let t5 = Instant::now();
-    conn.execute("DELETE FROM entry_points", [])?;
-    let entry_points = entrypoints::detect(&conn, &facts, config.min_confidence)?;
-    tracing::info!(
-        "Entry points detected in {:.1}s: {} total",
-        t5.elapsed().as_secs_f32(),
-        entry_points.len()
-    );
+    let codemap = codemap::build(&all_facts, &entry_points, config);
+    let content = codemap::writer::write(&codemap);
+    std::fs::write(&config.out_path, &content)?;
 
-    // ── Step 7: Trace generation (parallel) ──────────────────────────────
-    let t6 = Instant::now();
-    let trace_config = TraceConfig {
-        max_depth:      config.max_depth,
-        max_tokens:     2000,
-        min_confidence: config.min_confidence,
-    };
-    conn.execute("DELETE FROM traces", [])?;
-    let trace_eps = if config.all_entrypoints {
-        entry_points.clone()
-    } else {
-        entry_points.iter().filter(|e| e.confidence >= config.min_confidence).cloned().collect()
-    };
-    traces::generate_traces(&conn, &trace_eps, &trace_config, false)?;
-    tracing::info!("Traces generated in {:.1}s", t6.elapsed().as_secs_f32());
+    hash::save_cache(&hashed, &cache_path);
 
-    print_stats(&conn);
-    db::store::checkpoint(&conn, "pipeline", "run", "done", Some("complete"))?;
+    let line_count = content.lines().count();
+    tracing::info!("Wrote {} ({} lines)", config.out_path, line_count);
+
+    println!("\n=== Codemap Summary ===");
+    println!("  output:    {}", config.out_path);
+    println!("  files:     {}", codemap.file_count);
+    println!("  languages: {}", codemap.languages.join(", "));
+    println!("  services:  {}", codemap.services.len());
+    println!("  topology:  {} cross-service flows", codemap.topology.len());
+    println!("  lines:     {}", line_count);
+
     Ok(())
-}
-
-fn print_stats(conn: &rusqlite::Connection) {
-    if let Ok(s) = db::store::stats(conn) {
-        println!("\n=== Index Summary ===");
-        println!("  files:           {}", s["files"]);
-        println!("  symbols:         {}", s["symbols"]);
-        println!("  edges:           {}", s["edges"]);
-        println!("  boundary_events: {}", s["boundary_events"]);
-        println!("  entry_points:    {}", s["entry_points"]);
-        println!("  traces:          {}", s["traces"]);
-    }
 }

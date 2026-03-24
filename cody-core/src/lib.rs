@@ -1,3 +1,4 @@
+pub mod codemap;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -6,7 +7,4 @@ pub mod lsp;
 pub mod patterns;
 pub mod pipeline;
 pub mod plugin;
-pub mod query;
-pub mod search;
 pub mod traces;
-pub mod embed;

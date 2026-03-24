@@ -1,5 +1,5 @@
 ---
-description: Use cody (codebase semantic indexer) to analyze a project. Run queries against the index.
+description: Use cody (codebase semantic indexer) to analyze a project. Reads the codemap.md file.
 argument-hint: "<question or task>"
 ---
 
@@ -7,124 +7,88 @@ You have access to **cody** — a static codebase semantic indexer for multi-lan
 
 ## Philosophy
 
-cody builds a SQLite index from source code using tree-sitter (no LLM during indexing). The index captures:
-- **symbols**: functions, classes, methods across JS/TS/Python/Ruby/Rust
-- **edges**: call graph (who calls what), data flow, imports
-- **boundary_events**: I/O operations (redis, kafka, sql, http_header, grpc)
-- **entry_points**: exposed endpoints with route paths, HTTP methods, middleware
-- **boundary_flows**: write→read pairs stitched across services
-- **traces**: human-readable execution paths from entry points to I/O
+cody generates a `codemap.md` file from source code using tree-sitter (no LLM during indexing). The codemap captures:
+- **Service topology**: which services call which, via what gRPC/kafka/redis keys
+- **Routes**: HTTP endpoints grouped by service and auth middleware
+- **I/O boundaries**: what each endpoint reads and writes (redis, sql, kafka, grpc)
+- **Middleware/auth**: which routes are public vs. authenticated, and with what middleware
 
-Use the index first to navigate, then read targeted source files for detail.
+Read the codemap first to orient yourself, then read targeted source files for detail.
 
 ## Setup
 
 ```bash
-# Auto-detect binary and most recent .db file in current directory
+# Auto-detect binary
 CODY=$(which cody 2>/dev/null || echo "./target/release/cody")
-DB=$(ls -t *.db 2>/dev/null | head -1)
 
-# If no .db found, build one first:
-# cody index . --db my-project.db [--lsp]
+# Generate / refresh the codemap (run from the project root)
+$CODY . --out codemap.md
+
+# Or with LSP verification (removes false positives, takes 30-120s):
+$CODY . --out codemap.md --lsp
 ```
 
-## CLI reference — exact syntax
+## Reading the codemap
+
+The codemap is a markdown file — **read it directly**. It is organized as:
 
 ```
-cody query --db <path> <COMMAND> [ARGS]
+## Service Topology
+<src_service>  →  <dst_service>   <medium>: <key1>, <key2>
+
+## <service> [<language>]
+
+### Public
+METHOD /path
+  in:   body{Type}, headers{key}
+  <medium>: reads <key>
+  <medium>: writes <key>
+  grpc: → (Type)
+
+### [auth: <middleware>]
+...
+
+### Background
+<fn_name>
+  <medium>: reads <key>
 ```
 
-> **`--db` must come BEFORE the subcommand.**
+## Workflow
 
-| Command | Args | Description |
-|---|---|---|
-| `stats` | | Row counts for all tables |
-| `lookup` | `<name>` | Exact match, falls back to fuzzy substring |
-| `callers` | `<symbol>` | Who calls this function |
-| `callees` | `<symbol>` | What this function calls |
-| `deps` | `<file>` | File-level import dependencies |
-| `path` | `<from> <to>` | Shortest call path between two functions |
-| `boundaries` | `<fn>` | I/O operations touched by a function |
-| `medium` | `<medium>` | All events for redis/kafka/sql/http_header/grpc |
-| `cross` | `<svc_a> <svc_b>` | Keys written by A and read by B |
-| `traces` | `<fn>` | Full execution trace from an entry point |
-| `topology` | | Service dependency graph |
+1. Read `codemap.md` (or the path specified in CLAUDE.md)
+2. Use the topology section to understand cross-service dependencies
+3. Find the service and route you care about
+4. Read targeted source files for implementation detail
 
 ```bash
-# CORRECT
-$CODY query --db $DB lookup login
-$CODY query --db $DB boundaries lp_auth_middleware
-$CODY query --db $DB traces login
+# Refresh the codemap if it exists but may be stale
+$CODY . --out codemap.md
 
-# WRONG — exit code 2: --db after subcommand
-$CODY query lookup --db $DB login
+# Read the codemap
+cat codemap.md
 
-# WRONG — exit code 1: never quote --db and the path together as one variable
-DB2="--db /path/to/db"
-$CODY query $DB2 lookup foo   # shell passes this as ONE argument, not two
+# Or read the codemap file directly with the Read tool
 ```
 
-## Example session
+## Regenerating
 
 ```bash
 CODY=$(which cody 2>/dev/null || echo "./target/release/cody")
-DB=$(ls -t *.db 2>/dev/null | head -1)
 
-# Overview
-$CODY query --db $DB stats
-$CODY query --db $DB topology
+# Basic (fast, ~5s)
+$CODY <dir> --out codemap.md
 
-# Find a symbol (fuzzy if no exact match)
-$CODY query --db $DB lookup AuthMiddleware
+# With LSP verification (more accurate, 30-120s)
+$CODY <dir> --out codemap.md --lsp
 
-# What I/O does a function touch?
-$CODY query --db $DB boundaries process_order
-
-# Full trace from an entry point
-$CODY query --db $DB traces create_order
-
-# All redis operations
-$CODY query --db $DB medium redis
-
-# All routes with middleware
-sqlite3 $DB 'SELECT fn_name, path, method, middleware FROM entry_points WHERE path IS NOT NULL ORDER BY path;'
-```
-
-## Schema reference
-
-```
-symbols(id, name, kind, file, line, signature, is_exported, prov_source, prov_confidence)
-edges(id, src_file, src_symbol, rel, dst_file, dst_symbol, context, line)
-file_meta(file, language, lines, exports, imports, hash)
-boundary_events(id, fn_name, file, line, direction, medium, key_raw, key_norm,
-                local_var, raw_context, prov_source, prov_confidence, prov_plugin, prov_note)
-boundary_flows(id, write_fn, write_file, read_fn, read_file, medium, key_norm, confidence)
-entry_points(id, fn_name, file, line, kind, framework, path, method,
-             confidence, heuristics, middleware)
-traces(id, trace_id, root_fn, root_file, service, text, compact, otlp,
-       span_count, fn_names, media, value_names, min_confidence, created_at)
-```
-
-## Useful sqlite3 queries
-
-```bash
-# Routes with auth middleware
-sqlite3 $DB 'SELECT fn_name, path, method, middleware FROM entry_points WHERE path IS NOT NULL ORDER BY path;'
-
-# Find symbols by name pattern (column is "name", not "fn_name")
-sqlite3 $DB 'SELECT name, kind, file, line FROM symbols WHERE name LIKE "%auth%" ORDER BY file;'
-
-# High-confidence boundary events
-sqlite3 $DB 'SELECT fn_name, medium, key_raw, prov_confidence FROM boundary_events WHERE prov_confidence > 0.8 ORDER BY prov_confidence DESC;'
-
-# gRPC flows between services
-sqlite3 $DB 'SELECT medium, key_raw, fn_name, file FROM boundary_events WHERE medium = "grpc";'
+# Custom depth or confidence
+$CODY <dir> --out codemap.md --depth 8 --min-confidence 0.4
 ```
 
 ## Task
 
 $ARGUMENTS
 
-If no task is given, show this help and ask what to explore.
+If no task is given, read `codemap.md` and summarize what services and routes exist, then ask what to explore.
 
-Use the cody CLI and sqlite3 commands above. Do NOT read source files first — use the index to orient, then read only the specific files needed for detail.
+Read the codemap file first. Do NOT run source file searches before reading it — use the codemap to orient, then read only the specific source files needed for detail.
