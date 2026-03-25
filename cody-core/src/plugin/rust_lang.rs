@@ -116,21 +116,42 @@ impl LanguagePlugin for RustPlugin {
                 *n == "key" || *n == "path" || *n == "sql"
             });
             if let Some(key_cap) = key_cap {
-                let key_raw = node_text(&key_cap.node, source)
-                    .trim_matches(|c| c == '"')
+                let raw_text = node_text(&key_cap.node, source);
+                // Strip string literal quotes. Handle both regular ("...") and raw (r#"..."#) strings.
+                // For non-literal keys (variables, refs), strip leading & and use the identifier name.
+                let key_raw = strip_rust_string_literal(raw_text)
+                    .trim_start_matches('&')
+                    .trim()
                     .to_string();
                 if key_raw.is_empty() { continue; }
                 let key_norm = crate::patterns::normalise_key(&key_raw);
                 let (medium, direction) = rust_classify(&pattern);
-                // Reclassify redis reads that are actually HTTP header reads.
-                // Headers.get("key") matches redis_get pattern (identifier receiver)
-                // but the key name reveals it's an HTTP header, not a redis key.
-                let (medium, direction) = if medium == "redis" && direction == "read"
-                    && is_http_header_name(&key_raw)
-                {
+                // For SQL queries, infer read vs write from the SQL verb.
+                let (medium, direction) = if medium == "sql" {
+                    let sql_upper = key_raw.trim_start().to_uppercase();
+                    let dir = if sql_upper.starts_with("SELECT") || sql_upper.starts_with("WITH") {
+                        "read"
+                    } else if sql_upper.starts_with("INSERT") || sql_upper.starts_with("UPDATE")
+                        || sql_upper.starts_with("DELETE") || sql_upper.starts_with("MERGE")
+                        || sql_upper.starts_with("UPSERT")
+                    {
+                        "write"
+                    } else {
+                        direction.as_str()
+                    };
+                    ("sql".to_string(), dir.to_string())
+                // Reclassify redis reads that are HTTP header reads by key name.
+                } else if medium == "redis" && direction == "read" && is_http_header_name(&key_raw) {
                     ("http_header".to_string(), "read".to_string())
                 } else {
                     (medium, direction)
+                };
+                // For SQL: use table name as the display key, not the full query string
+                let key_norm = if medium == "sql" {
+                    let t = sql_table_name(&key_raw);
+                    if t.is_empty() { key_norm } else { t }
+                } else {
+                    key_norm
                 };
                 events.push(BoundaryEvent {
                     fn_name: "<module>".into(), file: file_str.clone(),
@@ -243,6 +264,60 @@ impl LanguagePlugin for RustPlugin {
         let imports = src.matches("use ").count();
         Ok(FileMetaCounts { lines, exports, imports })
     }
+}
+
+/// Strip Rust string literal delimiters from a captured node's text.
+/// Handles: "regular", r"raw", r#"raw_hash"#, r##"raw_double_hash"##
+/// Non-string nodes (identifiers, expressions) are returned as-is.
+fn strip_rust_string_literal(s: &str) -> &str {
+    let s = s.trim();
+    // Raw string: r"..." or r#"..."# etc.
+    if s.starts_with('r') {
+        let after_r = &s[1..];
+        let hash_count = after_r.chars().take_while(|&c| c == '#').count();
+        let prefix_len = 1 + hash_count + 1; // r + hashes + opening "
+        let suffix_len = 1 + hash_count;      // closing " + hashes
+        if s.len() >= prefix_len + suffix_len {
+            let inner = &s[prefix_len..s.len() - suffix_len];
+            // Verify the prefix ends with " and suffix starts with "
+            if s.as_bytes().get(prefix_len - 1) == Some(&b'"')
+                && s.as_bytes().get(s.len() - suffix_len) == Some(&b'"')
+            {
+                return inner;
+            }
+        }
+    }
+    // Regular string: "..."
+    s.trim_matches('"')
+}
+
+/// Extract the primary table name from a SQL string for display purposes.
+/// e.g. "SELECT id FROM users WHERE ..." → "users"
+///      "INSERT INTO pacts (...) VALUES ..." → "pacts"
+///      "DELETE FROM segmented_configs WHERE ..." → "segmented_configs"
+fn sql_table_name(sql: &str) -> String {
+    // Normalise whitespace
+    let s = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let upper = s.to_uppercase();
+
+    // Find keyword that precedes the table name
+    let after = if let Some(i) = upper.find("FROM ") {
+        &s[i + 5..]
+    } else if let Some(i) = upper.find("INTO ") {
+        &s[i + 5..]
+    } else if let Some(i) = upper.find("UPDATE ") {
+        &s[i + 7..]
+    } else if let Some(i) = upper.find("JOIN ") {
+        &s[i + 5..]
+    } else {
+        return String::new();
+    };
+
+    // Take the first word, strip any trailing punctuation
+    after.split_whitespace().next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+        .to_lowercase()
 }
 
 /// Returns true if the key looks like an HTTP header name rather than a redis key.
