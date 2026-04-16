@@ -43,6 +43,7 @@ pub fn run_map(config: &MapConfig) -> Result<()> {
     tracing::info!("Extracted {} files in {:.1}s", all_facts.len(), t3.elapsed().as_secs_f32());
 
     if config.use_lsp {
+        // ── Pass 1: boundary event confidence enrichment (hover) ──────────────
         let t_lsp = Instant::now();
         let all_events: Vec<_> = all_facts.iter()
             .flat_map(|f| f.boundary_events.clone())
@@ -58,7 +59,6 @@ pub fn run_map(config: &MapConfig) -> Result<()> {
                     t_lsp.elapsed().as_secs_f32(),
                     stats.events_checked, stats.events_confirmed, stats.events_rejected,
                 );
-                // Build lookup map for enriched events
                 let mut enriched_map: std::collections::HashMap<(String, String, String, String), (f64, Option<String>)> =
                     std::collections::HashMap::new();
                 for ev in &enriched {
@@ -79,6 +79,23 @@ pub fn run_map(config: &MapConfig) -> Result<()> {
                 }
             }
             Err(e) => tracing::warn!("LSP enrichment error: {e}"),
+        }
+
+        // ── Pass 2: resolve ambiguous call edges (go-to-definition) ───────────
+        // Patches edges that static symbol lookup can't resolve because the callee
+        // name is defined in multiple files (e.g. wrapper classes, service objects).
+        let t_edges = Instant::now();
+        let edge_result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(crate::lsp::resolve_ambiguous_edges(&mut all_facts, &config.root_dir))
+        });
+        match edge_result {
+            Ok(stats) => tracing::info!(
+                "LSP edge resolution in {:.1}s: {}/{} ambiguous edges resolved",
+                t_edges.elapsed().as_secs_f32(),
+                stats.resolved, stats.ambiguous_checked,
+            ),
+            Err(e) => tracing::warn!("LSP edge resolution error: {e}"),
         }
     }
 

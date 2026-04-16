@@ -3,9 +3,10 @@ use regex::Regex;
 
 // ── Rust / prost + tonic ───────────────────────────────────────────────────
 
-// encode_to_vec() on a struct: SomeMessage { ... }.encode_to_vec()  or  msg.encode_to_vec()
+// encode_to_vec() on an inline struct literal: SomeMessage { ... }.encode_to_vec()
+// Requires PascalCase name + struct literal body to avoid matching variable.encode_to_vec()
 pub static RUST_PROST_ENCODE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(\w+)\s*(?:\{[^}]*\})?\s*\.encode_to_vec\s*\(\s*\)"#).unwrap()
+    Regex::new(r#"([A-Z]\w+)\s*\{[^}]*\}\s*\.encode_to_vec\s*\(\s*\)"#).unwrap()
 });
 
 // SomeType::decode(&buf) or decode(&mut buf)

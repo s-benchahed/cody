@@ -36,6 +36,26 @@ static SPECS: &[ServerSpec] = &[
         languages:   &["python"],
         language_id: "python",
     },
+    // Go: official language server
+    ServerSpec {
+        binary:      "gopls",
+        args:        &["serve"],
+        languages:   &["go"],
+        language_id: "go",
+    },
+    // Ruby: ruby-lsp (Shopify) preferred, solargraph as fallback
+    ServerSpec {
+        binary:      "ruby-lsp",
+        args:        &[],
+        languages:   &["ruby"],
+        language_id: "ruby",
+    },
+    ServerSpec {
+        binary:      "solargraph",
+        args:        &["stdio"],
+        languages:   &["ruby"],
+        language_id: "ruby",
+    },
 ];
 
 /// Returns the first available server spec for each language,

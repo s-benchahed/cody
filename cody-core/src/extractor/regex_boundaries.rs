@@ -1,4 +1,6 @@
 use std::path::Path;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use crate::db::models::{BoundaryEvent, Symbol};
 use crate::patterns::{self, normalise_key};
 use crate::patterns::sql;
@@ -126,6 +128,90 @@ pub fn extract(source: &[u8], file: &Path, language: &str, _symbols: &[Symbol]) 
         if let Some(header) = key {
             let line = cap.get(0).map(|m| line_of(src, m.start()));
             events.push(make_event("<module>", &file_str, line, "read", "http_header", header.as_str(), language, None));
+        }
+    }
+
+    // ── Outbound HTTP calls (client-side JS/TS) ────────────────────────────
+    if matches!(language, "javascript" | "typescript") {
+        fn strip_base_url(url: &str) -> &str {
+            // 'https://api.example.com/foo/bar' → '/foo/bar'
+            // 'https://api.example.com' (no path) → returns empty string
+            // Relative paths (starting with '/') pass through unchanged.
+            if url.starts_with('/') { return url; }
+            let after_scheme = url.strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))
+                .unwrap_or(url);
+            if let Some(pos) = after_scheme.find('/') {
+                &after_scheme[pos..]
+            } else {
+                ""
+            }
+        }
+
+        // Normalize template-literal interpolations so `/users/${id}/comments/${cid}`
+        // → `/users/:param/comments/:param` (collapses into a stable topology key).
+        static TEMPLATE_INTERP_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r#"\$\{[^}]*\}"#).unwrap()
+        });
+        fn strip_template_interp(s: &str) -> String {
+            TEMPLATE_INTERP_RE.replace_all(s, ":param").to_string()
+        }
+
+        for cap in patterns::http::JS_FETCH_URL_RE.captures_iter(src) {
+            if let Some(url) = cap.get(1) {
+                let path = strip_base_url(url.as_str()).trim_end_matches('/');
+                if path.len() > 1 {
+                    let line = cap.get(0).map(|m| line_of(src, m.start()));
+                    events.push(make_event("<module>", &file_str, line, "write", "http_out", path, language, None));
+                }
+            }
+        }
+
+        for cap in patterns::http::JS_FETCH_TEMPLATE_RE.captures_iter(src) {
+            if let Some(raw) = cap.get(1) {
+                let normalized = strip_template_interp(raw.as_str());
+                let path = strip_base_url(&normalized).trim_end_matches('/').to_string();
+                if path.len() > 1 {
+                    let line = cap.get(0).map(|m| line_of(src, m.start()));
+                    events.push(make_event("<module>", &file_str, line, "write", "http_out", &path, language, None));
+                }
+            }
+        }
+
+        for cap in patterns::http::JS_PROTO_CLIENT_RE.captures_iter(src) {
+            if let Some(path) = cap.get(1) {
+                let p = path.as_str().trim_end_matches('/');
+                if p.len() > 1 {
+                    let line = cap.get(0).map(|m| line_of(src, m.start()));
+                    events.push(make_event("<module>", &file_str, line, "write", "http_out", p, language, None));
+                }
+            }
+        }
+
+        for cap in patterns::http::JS_HTTP_CLIENT_RE.captures_iter(src) {
+            if let Some(path_cap) = cap.get(2) {
+                // Only keep URL-like paths — must start with '/' or be a full URL.
+                let raw = path_cap.as_str();
+                let looks_like_url = raw.starts_with('/')
+                    || raw.starts_with("http://")
+                    || raw.starts_with("https://");
+                if !looks_like_url { continue; }
+                let path = strip_base_url(raw).trim_end_matches('/');
+                if path.len() > 1 {
+                    let line = cap.get(0).map(|m| line_of(src, m.start()));
+                    events.push(make_event("<module>", &file_str, line, "write", "http_out", path, language, None));
+                }
+            }
+        }
+
+        for cap in patterns::http::JS_URL_CONST_RE.captures_iter(src) {
+            if let Some(url) = cap.get(1) {
+                let path = strip_base_url(url.as_str()).trim_end_matches('/');
+                if path.len() > 1 {
+                    let line = cap.get(0).map(|m| line_of(src, m.start()));
+                    events.push(make_event("<module>", &file_str, line, "write", "http_out", path, language, None));
+                }
+            }
         }
     }
 

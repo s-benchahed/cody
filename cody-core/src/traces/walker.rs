@@ -57,7 +57,7 @@ pub fn collect_io(
     fn_name: &str,
     file: &str,
     adj: &AdjacencyMap,
-    boundary_index: &HashMap<String, Vec<BoundaryEvent>>,
+    boundary_index: &HashMap<(String, String), Vec<BoundaryEvent>>,
     max_depth: usize,
 ) -> Vec<BoundaryEvent> {
     let mut result: Vec<BoundaryEvent> = Vec::new();
@@ -71,14 +71,15 @@ pub fn collect_io(
 fn dfs(
     fn_name: &str, file: &str,
     adj: &AdjacencyMap,
-    boundary_index: &HashMap<String, Vec<BoundaryEvent>>,
+    boundary_index: &HashMap<(String, String), Vec<BoundaryEvent>>,
     max_depth: usize, depth: usize,
     visited: &mut HashSet<String>,
     result: &mut Vec<BoundaryEvent>,
 ) {
-    if depth > max_depth || visited.contains(fn_name) { return; }
-    visited.insert(fn_name.to_string());
-    if let Some(evs) = boundary_index.get(fn_name) {
+    let visit_key = format!("{}:{}", fn_name, file);
+    if depth > max_depth || visited.contains(&visit_key) { return; }
+    visited.insert(visit_key);
+    if let Some(evs) = boundary_index.get(&(fn_name.to_string(), file.to_string())) {
         result.extend(evs.iter().cloned());
     }
     if let Some(children) = adj.get(&(fn_name.to_string(), file.to_string())) {

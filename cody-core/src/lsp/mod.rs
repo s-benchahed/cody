@@ -8,6 +8,7 @@ use anyhow::Result;
 use client::LspClient;
 use servers::ServerSpec;
 use crate::db::models::BoundaryEvent;
+use crate::extractor::ExtractedFacts;
 
 #[derive(Debug, Default)]
 pub struct LspStats {
@@ -278,6 +279,192 @@ fn classify_hover(text: &str, medium: &str) -> HoverVerdict {
         _ => HoverVerdict::Unknown,
     }
 }
+
+// ── edge resolution via textDocument/definition ────────────────────────────
+
+#[derive(Debug, Default)]
+pub struct LspEdgeStats {
+    pub ambiguous_checked: usize,
+    pub resolved:          usize,
+}
+
+struct Candidate {
+    facts_idx:  usize,
+    edge_idx:   usize,
+    src_file:   String,
+    language:   String,
+    line:       i64,
+    dst_symbol: String,
+}
+
+/// For every call edge where `dst_file` is None and the callee symbol is defined
+/// in more than one file (ambiguous for static resolution), use LSP
+/// `textDocument/definition` at the call site to resolve the exact target file.
+/// Patches `dst_file` in-place so `build_adjacency` takes the direct-edge path.
+pub async fn resolve_ambiguous_edges(
+    all_facts: &mut Vec<ExtractedFacts>,
+    root_dir: &Path,
+) -> Result<LspEdgeStats> {
+    let mut stats = LspEdgeStats::default();
+
+    let available = servers::detect();
+    if available.is_empty() {
+        tracing::info!("LSP edge resolution: no language servers found — skipping");
+        return Ok(stats);
+    }
+
+    // Build symbol → files map (same logic as build_adjacency)
+    let mut symbol_files: HashMap<String, Vec<String>> = HashMap::new();
+    for facts in all_facts.iter() {
+        for sym in &facts.symbols {
+            if sym.kind == "function" {
+                symbol_files.entry(sym.name.clone())
+                    .or_default()
+                    .push(facts.file.clone());
+            }
+        }
+    }
+
+    // Collect ambiguous edges: dst_file=None, symbol defined in >1 file
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for (fi, facts) in all_facts.iter().enumerate() {
+        for (ei, edge) in facts.edges.iter().enumerate() {
+            if edge.rel != "calls" || edge.dst_file.is_some() { continue; }
+            let dst_sym = match &edge.dst_symbol { Some(s) => s.clone(), None => continue };
+            let line    = match edge.line          { Some(l) => l,        None => continue };
+            let src     = match &edge.src_file     { Some(f) => f.clone(), None => continue };
+            let count   = symbol_files.get(&dst_sym).map_or(0, |v| v.len());
+            if count <= 1 { continue; } // static resolution handles this already
+            candidates.push(Candidate {
+                facts_idx: fi, edge_idx: ei,
+                src_file: src, language: facts.language.clone(),
+                line, dst_symbol: dst_sym,
+            });
+        }
+    }
+
+    stats.ambiguous_checked = candidates.len();
+    if candidates.is_empty() { return Ok(stats); }
+    tracing::info!("LSP edge resolution: {} ambiguous edges to resolve", candidates.len());
+
+    // Group by language → workspace → [candidate indices]
+    let mut by_lang: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, c) in candidates.iter().enumerate() {
+        by_lang.entry(c.language.clone()).or_default().push(i);
+    }
+
+    // patches: (facts_idx, edge_idx, resolved_file_string)
+    let mut patches: Vec<(usize, usize, String)> = Vec::new();
+
+    for (lang, lang_idxs) in &by_lang {
+        let Some(spec) = available.get(lang.as_str()) else { continue };
+
+        let mut by_workspace: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+        for &i in lang_idxs {
+            let ws = find_workspace_root(Path::new(&candidates[i].src_file), lang)
+                .unwrap_or_else(|| root_dir.to_path_buf());
+            by_workspace.entry(ws).or_default().push(i);
+        }
+
+        for (workspace, ws_idxs) in &by_workspace {
+            let ws_candidates: Vec<&Candidate> = ws_idxs.iter().map(|&i| &candidates[i]).collect();
+            tracing::info!(
+                "LSP edge resolution: starting {} for {} ({} edges)",
+                spec.binary, workspace.display(), ws_candidates.len()
+            );
+            match resolve_edges_workspace(&workspace, spec, &ws_candidates, root_dir, &mut stats).await {
+                Ok(mut batch) => patches.append(&mut batch),
+                Err(e) => tracing::warn!("LSP edge resolution failed for {lang}: {e}"),
+            }
+        }
+    }
+
+    // Apply patches
+    for (fi, ei, resolved) in patches {
+        if let Some(edge) = all_facts.get_mut(fi).and_then(|f| f.edges.get_mut(ei)) {
+            edge.dst_file = Some(resolved);
+        }
+    }
+
+    tracing::info!(
+        "LSP edge resolution: resolved {}/{} ambiguous edges",
+        stats.resolved, stats.ambiguous_checked
+    );
+    Ok(stats)
+}
+
+async fn resolve_edges_workspace(
+    workspace:  &Path,
+    spec:       &ServerSpec,
+    candidates: &[&Candidate],
+    root_dir:   &Path,
+    stats:      &mut LspEdgeStats,
+) -> Result<Vec<(usize, usize, String)>> {
+    // Candidate is a local struct — we can reference it because resolve_edges_workspace
+    // is defined in the same module scope as resolve_ambiguous_edges.
+    let mut lsp = LspClient::spawn(spec.binary, spec.args, workspace).await?;
+    let mut patches: Vec<(usize, usize, String)> = Vec::new();
+
+    // Group by source file so we open each file once
+    let mut by_file: HashMap<&str, Vec<&Candidate>> = HashMap::new();
+    for c in candidates {
+        by_file.entry(c.src_file.as_str()).or_default().push(c);
+    }
+
+    for (file_path, file_candidates) in &by_file {
+        let path = std::path::PathBuf::from(file_path);
+        let Ok(source) = std::fs::read_to_string(&path) else { continue };
+        let lines: Vec<&str> = source.lines().collect();
+
+        if let Err(e) = lsp.open_file(&path, &source, spec.language_id).await {
+            tracing::debug!("LSP definition: open_file {file_path}: {e}");
+            continue;
+        }
+
+        for c in file_candidates {
+            let line_0 = (c.line - 1).max(0) as usize;
+            let Some(&line_text) = lines.get(line_0) else { continue };
+
+            // Find the column of the callee symbol on this line
+            let Some(col) = find_symbol_col(line_text, &c.dst_symbol) else { continue };
+
+            match lsp.definition(&path, line_0 as u32, col as u32, root_dir).await {
+                Ok(Some(resolved_path)) => {
+                    let resolved_str = resolved_path.to_string_lossy().into_owned();
+                    tracing::debug!(
+                        "LSP definition: {}:{} {}() → {}",
+                        file_path, c.line, c.dst_symbol, resolved_str
+                    );
+                    patches.push((c.facts_idx, c.edge_idx, resolved_str));
+                    stats.resolved += 1;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::debug!("LSP definition error for {}: {e}", c.dst_symbol),
+            }
+        }
+    }
+
+    lsp.shutdown().await.ok();
+    Ok(patches)
+}
+
+/// Find the column (byte offset) of the first occurrence of `symbol` on `line`.
+fn find_symbol_col(line: &str, symbol: &str) -> Option<usize> {
+    // Look for the symbol as a whole word (not a substring of a longer identifier)
+    let mut start = 0;
+    while let Some(pos) = line[start..].find(symbol) {
+        let abs = start + pos;
+        let before_ok = abs == 0 || !line.as_bytes().get(abs - 1).map_or(false, |&b| b.is_ascii_alphanumeric() || b == b'_');
+        let after_ok  = !line.as_bytes().get(abs + symbol.len()).map_or(false, |&b| b.is_ascii_alphanumeric() || b == b'_');
+        if before_ok && after_ok {
+            return Some(abs);
+        }
+        start = abs + 1;
+    }
+    None
+}
+
+// (find_receiver_col follows below)
 
 fn find_receiver_col(line: &str, medium: &str) -> Option<usize> {
     let method_patterns: &[&str] = match medium {

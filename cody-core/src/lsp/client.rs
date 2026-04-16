@@ -154,6 +154,55 @@ impl LspClient {
         Ok(text)
     }
 
+    /// Request go-to-definition at (line, col) — both 0-indexed.
+    /// Returns the resolved file path if the server responds with a location inside
+    /// the given `project_root` (library/gem files are filtered out).
+    pub async fn definition(
+        &mut self,
+        path: &Path,
+        line: u32,
+        col: u32,
+        project_root: &Path,
+    ) -> Result<Option<std::path::PathBuf>> {
+        let id = self.next_id();
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/definition",
+            "params": {
+                "textDocument": { "uri": path_to_uri(path) },
+                "position": { "line": line, "character": col }
+            }
+        })).await?;
+
+        let timeout = tokio::time::Duration::from_secs(5);
+        let result = tokio::time::timeout(timeout, async {
+            loop {
+                let msg = self.recv().await?;
+                if msg.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                    return Ok::<Value, anyhow::Error>(msg);
+                }
+            }
+        }).await.map_err(|_| anyhow!("definition timeout"))??;
+
+        // Result may be: null | Location | Location[] | LocationLink[]
+        // Location = { uri, range }   LocationLink = { targetUri, ... }
+        let uri = result.pointer("/result/uri")
+            .or_else(|| result.pointer("/result/0/uri"))
+            .or_else(|| result.pointer("/result/0/targetUri"))
+            .and_then(|v| v.as_str());
+
+        let Some(uri) = uri else { return Ok(None); };
+        let Some(resolved) = uri_to_path(uri) else { return Ok(None); };
+
+        // Filter out paths outside the project root (library/gem/vendor code)
+        if resolved.starts_with(project_root) {
+            Ok(Some(resolved))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Graceful shutdown.
     pub async fn shutdown(&mut self) -> Result<()> {
         let id = self.next_id();
@@ -215,4 +264,8 @@ fn path_to_uri(path: &Path) -> String {
             .join(path)
     };
     format!("file://{}", abs.display())
+}
+
+pub fn uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    uri.strip_prefix("file://").map(std::path::PathBuf::from)
 }

@@ -3,6 +3,9 @@ pub mod typescript;
 pub mod python;
 pub mod ruby;
 pub mod rust_lang;
+pub mod go_lang;
+pub mod java;
+pub mod php;
 pub mod registry;
 
 use std::path::Path;

@@ -13,11 +13,19 @@
     attribute: (identifier) @fn (#eq? @fn "getenv"))
   arguments: (argument_list (string) @key .)) @env_read2
 
-; redis reads: get, hget, delete, rpop
+; redis reads: get — only on known Redis client variables (r, redis, cache, conn, client, etc.)
+; This avoids matching dict.get(), response.get(), etc.
 (call
   function: (attribute
-    object: (identifier) @obj
-    attribute: (identifier) @method (#match? @method "^(get|hget|delete|rpop|lrange|zrange|exists|ttl)$"))
+    object: (identifier) @obj (#match? @obj "^(r|redis|cache|conn|client|redis_client|redis_conn|pipe|pipeline)$")
+    attribute: (identifier) @method (#eq? @method "get"))
+  arguments: (argument_list (string) @key .)) @redis_get
+
+; redis reads: unambiguously Redis-only methods (safe to match on any object)
+(call
+  function: (attribute
+    object: (identifier) @obj2
+    attribute: (identifier) @method2 (#match? @method2 "^(hget|rpop|lrange|zrange|exists|ttl)$"))
   arguments: (argument_list (string) @key .)) @redis_get
 
 ; redis writes: set, hset, setex, lpush

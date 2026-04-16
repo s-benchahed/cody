@@ -68,6 +68,11 @@ pub fn service_from_path(file: &str) -> String {
         "internal", "cmd", "bin", "scripts", "utils", "helpers",
         "handlers", "services", "controllers", "routes", "middleware",
         "views", "models", "serializers", "resolvers",
+        // client-side common dirs
+        "api", "backend", "auth", "data", "hooks", "screens",
+        "navigation", "context", "store", "components",
+        // static/public asset dirs (keeps `static/app.js` under its parent service)
+        "static", "public", "assets", "dist", "build",
     ];
     dir_parts.iter().rev()
         .find(|c| !SKIP.contains(&c.as_str()))

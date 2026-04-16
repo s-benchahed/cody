@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use crate::plugin::LanguagePlugin;
 use crate::plugin::{javascript::JavaScriptPlugin, typescript::TypeScriptPlugin,
-                    python::PythonPlugin, ruby::RubyPlugin, rust_lang::RustPlugin};
+                    python::PythonPlugin, ruby::RubyPlugin, rust_lang::RustPlugin,
+                    go_lang::GoPlugin, java::JavaPlugin, php::PhpPlugin};
 
 pub type PluginRegistry = HashMap<String, Arc<dyn LanguagePlugin>>;
 
@@ -14,6 +15,9 @@ pub fn build_registry() -> PluginRegistry {
         Arc::new(PythonPlugin),
         Arc::new(RubyPlugin),
         Arc::new(RustPlugin),
+        Arc::new(GoPlugin),
+        Arc::new(JavaPlugin),
+        Arc::new(PhpPlugin),
     ];
     for plugin in plugins {
         for ext in plugin.extensions() {

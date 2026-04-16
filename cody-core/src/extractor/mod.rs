@@ -49,6 +49,11 @@ pub fn extract(pf: &ParsedFile) -> anyhow::Result<ExtractedFacts> {
 
     attribute_fn_names(&symbols, &mut combined);
 
+    // Drop `http_body` events — they're never displayed (entry points already
+    // carry inbound route info; outbound HTTP is `http_out`). They're an internal
+    // classifier artifact and just add noise to downstream processing.
+    combined.retain(|ev| ev.medium != "http_body");
+
     Ok(ExtractedFacts {
         file:            file.to_string_lossy().to_string(),
         language:        pf.plugin.language_name().to_string(),
